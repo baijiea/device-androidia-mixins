@@ -1,0 +1,29 @@
+From 793f8d551552e3f24496921a9058bde25712bd5a Mon Sep 17 00:00:00 2001
+From: Chen Lin Z <lin.z.chen@intel.com>
+Date: Fri, 18 Oct 2019 10:23:58 +0800
+Subject: [PATCH] indent adjust
+
+Signed-off-by: Chen Lin Z <lin.z.chen@intel.com>
+---
+ menuconfig.py | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/menuconfig.py b/menuconfig.py
+index 552b537..efd1de7 100755
+--- a/menuconfig.py
++++ b/menuconfig.py
+@@ -2973,8 +2973,10 @@ def _node_str(node):
+         indent += _SUBMENU_INDENT
+         parent = parent.parent
+ 
++    string = _value_str(node)
++    string = (indent) * " " + string
+     # This approach gives nice alignment for empty string symbols ("()  Foo")
+-    s = "{:{}}".format(_value_str(node), 3 + indent)
++    s = "{:}".format(string)
+ 
+     if _should_show_name(node):
+         if isinstance(node.item, Symbol):
+-- 
+1.9.1
+

@@ -14,6 +14,7 @@ import tempfile
 import stat
 import logging
 import filecmp
+import operator
 from filecmp import dircmp
 pystache.defaults.MISSING_TAGS = 'strict'
 
@@ -40,6 +41,7 @@ class Configurer:
     EXEMPT_FN = "exempt_groups.txt"
     RULE_FN = "new_group_creation_rule.txt"
     VALID_TARGETS_FN = "valid_targets.spec"
+    DOMAIN_SPEC_FN = "domain.spec"
     SCRIPT_FN = "mixin-update"
     VERSION = "3.2.3"
 
@@ -621,6 +623,8 @@ class Parser(FileHelper):
         self.internal_mixins_tree = {}
         self.file_map = {}
         self.group_deps = set()
+        # used by Converter to convert kconfig name into mixins
+        self.k2m = {}
 
 
 
@@ -751,6 +755,9 @@ class Parser(FileHelper):
             mixins_tree[group]["options"] = {}
             mixins_tree[group]["deps"] = set()
             mixins_tree[group]["doc"] = {}
+            group_kconfig_name = group.replace('_', '-').upper()
+            mixins_tree[group]["kconfig"] = group_kconfig_name
+            self.k2m[group_kconfig_name] = group
 
             # Check for a mixinfo file in the root of the group directory
             # This is for metadata about the group as a whole. Its presence
@@ -790,6 +797,10 @@ class Parser(FileHelper):
 
                 cur_opt["deps"] = set()
                 cur_opt["defaults"] = {}
+                cur_opt["params"] = {}
+                option_kconfig_name = group_kconfig_name + "_" + option.replace('_', '-').replace('+', '-').upper()
+                cur_opt["kconfig"] = option_kconfig_name
+                self.k2m[option_kconfig_name] = group + " " + option
 
                 option_spec_fn = os.path.join(cur_opt["optiondir"], Configurer.OPTION_SPEC_FN)
                 if option == "default" and os.path.islink(cur_opt["optiondir"]):
@@ -808,6 +819,11 @@ class Parser(FileHelper):
                     if cp.has_section("defaults"):
                         for k, v in cp.items("defaults"):
                             cur_opt["defaults"][k] = v
+                            cur_opt["params"][k] = {}
+                            cur_opt["params"][k]["value"] = v
+                            param_kconfig_name = option_kconfig_name + "_" + k.replace('_', '-').replace('+', '-').upper()
+                            cur_opt["params"][k]["kconfig"] = param_kconfig_name
+                            self.k2m[param_kconfig_name] = group + " " + option + " " + k
 
         if mixins_tree_dir == Configurer.INTERNAL_TREE:
             Parser.internal_mixins_tree_cache = mixins_tree
@@ -992,6 +1008,7 @@ class Parser(FileHelper):
         if self.product_dir == '':
             self.product_dir = '.'
         self.spec_selections = self._split_params(cp.items("groups"))
+        self.spec_selections2 = self._split_params(cp.items("groups"))
         self.spec_mixins_tree_dir = cp.get("main", "mixinsdir")
         if self.spec_mixins_tree_dir.startswith('.'):
             self.mixins_tree_dir = os.path.join(self.product_dir, self.spec_mixins_tree_dir.replace("./", ""))
@@ -1287,6 +1304,183 @@ class Updater(FileHelper):
         return retval
 
 
+class Converter(FileHelper):
+
+    def __init__(self, dry_run, abort_on_errors, log_level, tag):
+        FileHelper.__init__(self, abort_on_errors, "Converter-{}".format(tag))
+        self.dry_run = dry_run
+
+        if log_level == logging.DEBUG:
+            self.logger.setLevel(logging.DEBUG)
+        else:
+            if dry_run:
+                self.logger.setLevel(logging.WARNING)
+            else:
+                self.logger.setLevel(logging.INFO)
+
+    class ConfigItem():
+        def __init__(self, name, v_type, prompt, default, depends, help_str):
+            self.name = name
+            self.v_type = v_type
+            self.prompt = prompt
+            self.default = default.strip()
+            self.depends = depends
+            self.help_str = help_str
+
+        def print_config(self):
+            print "config {}".format(self.name)
+            print "    {} \"{}\"".format(self.v_type, self.prompt)
+            print "    default {}".format(self.default)
+            if self.depends != "":
+                print "    depends on {}".format(self.depends)
+            print "    help"
+            print "    {}".format(self.help_str)
+
+    class MenuItem():
+        def __init__(self, name):
+            self.name = name
+            self.config_items = []
+
+        def __getitem__(self, k):
+            if k == 'name':
+                return self.name
+
+        def add_config_item(self, config_item):
+            self.config_items.append(config_item)
+
+        def print_menu(self):
+            print "menu \"{}\"".format(self.name)
+            for item in self.config_items:
+                item.print_config()
+            print "endmenu\n"
+
+    def convert_to_kconfig(self, parser):
+
+        kconfigs = {}
+
+        for group, option, params in parser.spec_selections2:
+            group_kconfig_name = parser.mixins_tree[group]["kconfig"]
+            option_kconfig_name = parser.mixins_tree[group]["options"][option]["kconfig"]
+            if option == "false":
+                continue
+            kconfigs[group_kconfig_name] = "y"
+            if option != "true":
+                kconfigs[option_kconfig_name] = "y"
+            option_tree = parser.mixins_tree[group]["options"][option]
+            for param in sorted(option_tree["params"].keys()):
+                param_kconfig_name = option_tree["params"][param]["kconfig"]
+                kconfigs[param_kconfig_name] = option_tree["params"][param]["value"]
+
+            for k in sorted(params.keys()):
+                params_tree = parser.mixins_tree[group]["options"][option]["params"]
+                if k in params_tree.keys():
+                    param_kconfig_name = params_tree[k]["kconfig"]
+                    kconfigs[param_kconfig_name] = params[k]
+
+        for k in sorted(kconfigs.keys()):
+            v = str(kconfigs[k])
+            if v.lower() == "true":
+                v = "y"
+            elif v.lower() == "false":
+                continue
+            if not v.isdigit() and v != "y":
+                v = "\"" + v + "\""
+            print "CONFIG_" + k + "=" + v
+
+
+    def convert_to_mixins(self, parser, kconfig_fn):
+        configs = {}
+        cp = parser.read_spec_file(parser.spec_file)
+        with open("/tmp/mixins.config", "r") as sfile:
+            dlines = sfile.readlines()
+            for line in dlines:
+                if line.startswith('CONFIG_'):
+                    line1 = line[7:].replace("\n","")
+                    l = line1.split('=')
+                    one_cfg = parser.k2m[l[0]].split()
+                    group = one_cfg[0]
+                    if group not in configs.keys():
+                        configs[group] = {}
+                        configs[group]["options"] = {}
+                    size = len(one_cfg)
+                    if size == 2:
+                        option = one_cfg[1]
+                        if option not in configs[group]["options"].keys():
+                            configs[group]["options"][option] = {}
+                            configs[group]["options"][option]["params"] = {}
+                    elif size == 3:
+                        if option not in configs[group]["options"].keys():
+                            configs[group]["options"][option] = {}
+                            configs[group]["options"][option]["params"] = {}
+                        param = one_cfg[2]
+                        configs[group]["options"][option]["params"][param] = l[1]
+        for group in configs.keys():
+            if len(configs[group]["options"].keys()) != 0:
+                for option in configs[group]["options"].keys():
+                    if len(configs[group]["options"][option]["params"].keys()) != 0:
+                        for param in configs[group]["options"][option]["params"].keys():
+                            print 'group: {} option: {} params: {} params_value: {}'.format(group, option, param, configs[group]["options"][option]["params"][param])
+                    else:
+                            print 'group: {} option: {}'.format(group, option)
+            else:
+                print 'group: {} option: true'.format(group)
+
+    def generate_kconfig_file(self, parser):
+
+        fn = os.path.join(os.path.dirname(sys.argv[0]), Configurer.DOMAIN_SPEC_FN)
+        cp = parser.read_spec_file(fn)
+        menus = set()
+        group_to_menuitem = {}
+        for domain in cp.sections():
+            menuitem = self.MenuItem(domain)
+            menus.add(menuitem)
+            for group in cp.options(domain):
+                group_to_menuitem[group] = menuitem
+
+        unknow_menu = self.MenuItem("UNKNOW")
+        #menus.add(unknow_menu)
+
+        for group in sorted(parser.mixins_tree.keys()):
+            if group in group_to_menuitem.keys():
+                menuitem = group_to_menuitem[group]
+            else:
+                menuitem = unknow_menu
+            group_tree = parser.mixins_tree[group]
+            help_str = ""
+            group_config = self.ConfigItem(group_tree["kconfig"], "bool", group, "n", "", help_str)
+            menuitem.add_config_item(group_config)
+
+            for option in sorted(group_tree["options"].keys()):
+                if option in ["false", "default"]:
+                        continue
+                option_tree = group_tree["options"][option]
+                help_str = ""
+                if option != "true":
+                    option_config = self.ConfigItem(option_tree["kconfig"], "bool", option, "n", group_tree["kconfig"], help_str)
+                    menuitem.add_config_item(option_config)
+
+                for k in sorted(option_tree["params"].keys()):
+                    param_tree = option_tree["params"][k]
+                    default = param_tree["value"]
+                    if default.isdigit() :
+                        v_type = "int"
+                    elif default.lower() in ["false", "true"]:
+                        v_type = "bool"
+                    else:
+                        v_type = "string"
+                        default = "\"" + default + "\""
+                    help_str = ""
+                    if option == "true":
+                        dep_config = group_tree["kconfig"]
+                    else:
+                        dep_config = option_tree["kconfig"]
+                    param_config = self.ConfigItem(param_tree["kconfig"], v_type, k, default, dep_config, help_str)
+                    menuitem.add_config_item(param_config)
+
+        print 'mainmenu "Mixins GUI demo"\n'
+        for menuitem in sorted(list(menus), key=operator.itemgetter('name')):
+            menuitem.print_menu()
+
 def get_valid_spec_files_and_targets():
     fn = os.path.join(os.path.dirname(sys.argv[0]), Configurer.VALID_TARGETS_FN)
     dlines = []
@@ -1338,8 +1532,12 @@ def main(dry_run=False, sfiles=None, warn_only=False, debug_log=False, check_ver
         checker = Checker(abort_on_errors, tag)
         releaser = Releaser(dry_run, abort_on_errors, tag)
         updater = Updater(dry_run, abort_on_errors, log_level, tag)
+        converter = Converter(dry_run, abort_on_errors, log_level, tag)
         # parse
         parser.parse_spec_file()
+        converter.generate_kconfig_file(parser)
+        #converter.convert_to_kconfig(parser)
+        #converter.convert_to_mixins(parser, "")
         # check rules
         if parser.mixins_control:
             checker.check_rules(parser)

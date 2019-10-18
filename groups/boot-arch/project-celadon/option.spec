@@ -40,5 +40,5 @@ use_power_button = false
 userdata_checkpoint = false
 verity_mode = true
 verity_warning = true
-watchdog_parameters = false
+watchdog_parameters = 10 30
 mfgos = false

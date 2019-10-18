@@ -1,3 +1,3 @@
 [defaults]
 firmware =
-ivi =
+ivi = false
